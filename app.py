@@ -8,8 +8,8 @@ from datetime import datetime
 from typing import List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -20,11 +20,6 @@ from groq import Groq, BadRequestError
 # SQLAlchemy
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
-
-from fastapi import Request
-from fastapi.responses import Response
-
-
 
 # --------------------------------------------------
 # ENV SETUP
@@ -123,7 +118,6 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 # --------------------------------------------------
 # CORS
 # --------------------------------------------------
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # TEMP: allow all (safe for testing)
@@ -135,7 +129,6 @@ app.add_middleware(
 @app.options("/{path:path}")
 async def preflight_handler(path: str, request: Request):
     return Response(status_code=200)
-
 
 
 # --------------------------------------------------
@@ -196,21 +189,21 @@ def predict(req: ChatRequest):
             model=GROQ_MODEL,
             messages=[
                 {
-  "role": "system",
-  "content": (
-      "You are a public health assistant.\n"
-      "Format responses clearly using:\n"
-      "- Short paragraphs\n"
-      "- Bullet points when listing items\n"
-      "- Numbered questions when asking multiple questions\n"
-      "- Line breaks between sections\n"
-      "Keep responses easy to read on a mobile screen."
-  )
-},
-
+                    "role": "system",
+                    "content": (
+                        "You are a helpful and empathetic public health assistant.\n"
+                        "IMPORTANT FORMATTING INSTRUCTIONS:\n"
+                        "1. Use **standard Markdown** for all text.\n"
+                        "2. ALWAYS start every bullet point or numbered item on a **new line**.\n"
+                        "3. Use **Bold** for headers and key medical terms.\n"
+                        "4. Keep paragraphs short (2-3 sentences max) for mobile readability.\n"
+                        "5. Never combine multiple steps into a single paragraph."
+                    )
+                },
                 {"role": "user", "content": req.text},
             ],
-            max_tokens=300,
+            # Increased tokens to allow for properly formatted, longer lists
+            max_tokens=500,
         )
         return {"answer": resp.choices[0].message.content}
 
