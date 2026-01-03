@@ -121,11 +121,15 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 # --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later to Vercel domain
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:3000",
+        "https://healthcare-frontend-v1.vercel.app"
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 
 # --------------------------------------------------
