@@ -1,4 +1,4 @@
-# app.py — Combined Groq chatbot + health features + reminders
+# app.py — HealthBot Backend (API-only, Render-safe)
 
 import os
 import threading
@@ -8,18 +8,16 @@ from datetime import datetime
 from typing import List
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, Form
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# LLM client (Groq)
+# Groq client
 from groq import Groq, BadRequestError
 
-# SQLAlchemy (SQLite)
+# SQLAlchemy
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -113,31 +111,21 @@ async def lifespan(app: FastAPI):
 
 
 # --------------------------------------------------
-# FASTAPI APP (CREATE APP FIRST!)
+# FASTAPI APP
 # --------------------------------------------------
-app = FastAPI(title="HealthBot Combined", lifespan=lifespan)
+app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 
 
 # --------------------------------------------------
-# CORS (AFTER app is created)
+# CORS
 # --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-    ],
+    allow_origins=["*"],  # tighten later to Vercel domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# --------------------------------------------------
-# TEMPLATES & STATIC FILES
-# --------------------------------------------------
-templates = Jinja2Templates(directory="templates")
-app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 # --------------------------------------------------
@@ -181,14 +169,17 @@ def root():
     return {
         "status": "ok",
         "model": GROQ_MODEL,
-        "key_present": bool(GROQ_KEY),
+        "groq_key_present": bool(GROQ_KEY),
     }
 
 
 @app.post("/predict")
 def predict(req: ChatRequest):
     if not client:
-        return JSONResponse(500, {"error": "GROQ_API_KEY missing"})
+        return JSONResponse(
+            status_code=500,
+            content={"error": "GROQ_API_KEY missing"}
+        )
 
     try:
         resp = client.chat.completions.create(
@@ -202,50 +193,13 @@ def predict(req: ChatRequest):
         return {"answer": resp.choices[0].message.content}
 
     except BadRequestError as e:
-        return JSONResponse(400, {"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
     except Exception:
         print(traceback.format_exc())
-        return JSONResponse(500, {"error": "internal_error"})
+        return JSONResponse(status_code=500, content={"error": "internal_error"})
 
 
 @app.post("/symptom_check")
 def symptom_check(req: SymptomCheckRequest):
-    probable = match_diseases(req.symptoms)
-    return {"probable": probable}
-
-
-# --------------------------------------------------
-# CHAT UI ROUTES
-# --------------------------------------------------
-@app.get("/chat", response_class=HTMLResponse)
-def chat_page(request: Request):
-    return templates.TemplateResponse("chat.html", {"request": request})
-
-
-@app.post("/chat/send", response_class=HTMLResponse)
-def send_chat(request: Request, message: str = Form(...)):
-    if not client:
-        reply = "[ERROR] GROQ_API_KEY missing"
-    else:
-        try:
-            resp = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a public health assistant."},
-                    {"role": "user", "content": message},
-                ],
-                max_tokens=300,
-            )
-            reply = resp.choices[0].message.content
-        except Exception as e:
-            reply = f"[ERROR] {e}"
-
-    return templates.TemplateResponse(
-        "chat.html",
-        {
-            "request": request,
-            "user_message": message,
-            "bot_reply": reply,
-        },
-    )
+    return {"probable": match_diseases(req.symptoms)}
