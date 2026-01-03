@@ -21,6 +21,10 @@ from groq import Groq, BadRequestError
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
+from fastapi import Request
+from fastapi.responses import Response
+
+
 
 # --------------------------------------------------
 # ENV SETUP
@@ -119,16 +123,18 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 # --------------------------------------------------
 # CORS
 # --------------------------------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://healthcare-frontend-v1.vercel.app"
-    ],
+    allow_origins=["*"],  # TEMP: allow all (safe for testing)
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.options("/{path:path}")
+async def preflight_handler(path: str, request: Request):
+    return Response(status_code=200)
 
 
 
