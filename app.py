@@ -195,7 +195,19 @@ def predict(req: ChatRequest):
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {"role": "system", "content": "You are a public health assistant."},
+                {
+  "role": "system",
+  "content": (
+      "You are a public health assistant.\n"
+      "Format responses clearly using:\n"
+      "- Short paragraphs\n"
+      "- Bullet points when listing items\n"
+      "- Numbered questions when asking multiple questions\n"
+      "- Line breaks between sections\n"
+      "Keep responses easy to read on a mobile screen."
+  )
+},
+
                 {"role": "user", "content": req.text},
             ],
             max_tokens=300,
