@@ -1,10 +1,10 @@
-# app.py — HealthBot Backend (Production Ready)
+# app.py — HealthBot Backend (FINAL – Production Ready)
 # Features:
 # ✅ Multilingual responses
-# ✅ Real client IP detection (Render/Vercel safe)
+# ✅ Frontend city override + IP fallback
 # ✅ Live outbreak alerts via NewsAPI
+# ✅ Render/Vercel safe
 # ✅ Markdown formatted output
-# ✅ CORS enabled
 
 import os
 import threading
@@ -12,7 +12,7 @@ import time
 import traceback
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Optional
 
 import requests
 from fastapi import FastAPI, Request
@@ -71,6 +71,7 @@ def reminder_worker(interval: int = 15):
         try:
             db = SessionLocal()
             now = datetime.utcnow()
+
             rows = db.query(Reminder).filter(
                 Reminder.sent == False,
                 Reminder.remind_at <= now
@@ -114,7 +115,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -127,20 +128,18 @@ async def preflight_handler(path: str, request: Request):
 
 
 # --------------------------------------------------
-# REQUEST MODELS
+# REQUEST MODEL (🔥 UPDATED)
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
     language: str = "english"
+    city: Optional[str] = None   # ✅ FRONTEND OVERRIDE
 
 
 # --------------------------------------------------
-# REAL CLIENT IP (FIXED)
+# REAL CLIENT IP
 # --------------------------------------------------
 def get_real_ip(request: Request) -> Optional[str]:
-    """
-    Correct way to get real client IP behind Render / Vercel / proxies
-    """
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
@@ -222,29 +221,30 @@ def root():
 
 
 # --------------------------------------------------
-# MAIN CHAT ENDPOINT
+# MAIN CHAT ENDPOINT (🔥 FIXED)
 # --------------------------------------------------
 @app.post("/predict")
 def predict(req: ChatRequest, request: Request):
     if not client:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "GROQ_API_KEY missing"}
-        )
+        return JSONResponse(500, {"error": "GROQ_API_KEY missing"})
 
     try:
         language = req.language.lower()
 
-        # 🔑 FIXED IP DETECTION
-        client_ip = get_real_ip(request)
-        location = get_location_from_ip(client_ip)
+        # 1️⃣ City priority: frontend → IP → none
+        city = None
 
-        outbreak_alert = None
-        if location:
-            city, region, country = location
-            outbreak_alert = check_live_outbreaks(city)
+        if req.city:
+            city = req.city.strip().lower().title()
+        else:
+            client_ip = get_real_ip(request)
+            location = get_location_from_ip(client_ip)
+            if location:
+                city, _, _ = location
 
-        # 🧠 LLM RESPONSE
+        outbreak_alert = check_live_outbreaks(city) if city else None
+
+        # 2️⃣ LLM RESPONSE
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -254,9 +254,8 @@ def predict(req: ChatRequest, request: Request):
                         f"You are a public health assistant.\n"
                         f"Respond ONLY in {language}.\n"
                         "Use Markdown.\n"
-                        "Use short paragraphs.\n"
-                        "Use bullet points for lists.\n"
-                        "Avoid long walls of text."
+                        "Use bullet points.\n"
+                        "Keep paragraphs short."
                     )
                 },
                 {"role": "user", "content": req.text},
@@ -272,11 +271,8 @@ def predict(req: ChatRequest, request: Request):
         return {"answer": answer}
 
     except BadRequestError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return JSONResponse(400, {"error": str(e)})
 
     except Exception:
         print(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"error": "internal_error"}
-        )
+        return JSONResponse(500, {"error": "internal_error"})
