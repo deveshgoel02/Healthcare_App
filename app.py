@@ -1,4 +1,4 @@
-# app.py — HealthBot Backend (API-only, Render-safe)
+# app.py — HealthBot Backend (API-only, Render-safe, Multilingual)
 
 import os
 import threading
@@ -20,6 +20,7 @@ from groq import Groq, BadRequestError
 # SQLAlchemy
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
+
 
 # --------------------------------------------------
 # ENV SETUP
@@ -63,7 +64,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # --------------------------------------------------
-# REMINDER BACKGROUND WORKER
+# BACKGROUND WORKER (unchanged)
 # --------------------------------------------------
 STOP_FLAG = False
 _worker_thread = None
@@ -74,6 +75,7 @@ def reminder_worker(check_interval: int = 15):
         try:
             db = SessionLocal()
             now = datetime.utcnow()
+
             rows = db.query(Reminder).filter(
                 Reminder.sent == False,
                 Reminder.remind_at <= now
@@ -120,11 +122,12 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 # --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TEMP: allow all (safe for testing)
+    allow_origins=["*"],  # safe for testing
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 @app.options("/{path:path}")
 async def preflight_handler(path: str, request: Request):
@@ -136,6 +139,7 @@ async def preflight_handler(path: str, request: Request):
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
+    language: str = "English"
 
 
 class SymptomCheckRequest(BaseModel):
@@ -145,7 +149,30 @@ class SymptomCheckRequest(BaseModel):
 
 
 # --------------------------------------------------
-# HEALTH LOGIC
+# TRANSLATION HELPER (NEW)
+# --------------------------------------------------
+def translate_text(text: str, target_language: str):
+    if not target_language or target_language.lower() == "english":
+        return text
+
+    prompt = (
+        f"Translate the following medical response into {target_language}. "
+        f"Keep it accurate, clear, and simple.\n\n{text}"
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return text  # fallback
+
+
+# --------------------------------------------------
+# HEALTH LOGIC (simple matching)
 # --------------------------------------------------
 DISEASE_SYMPTOMS = {
     "dengue": {"fever", "headache", "joint pain", "rash"},
@@ -185,6 +212,7 @@ def predict(req: ChatRequest):
         )
 
     try:
+        # 1️⃣ Generate answer in English
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -192,20 +220,22 @@ def predict(req: ChatRequest):
                     "role": "system",
                     "content": (
                         "You are a helpful and empathetic public health assistant.\n"
-                        "IMPORTANT FORMATTING INSTRUCTIONS:\n"
-                        "1. Use **standard Markdown** for all text.\n"
-                        "2. ALWAYS start every bullet point or numbered item on a **new line**.\n"
-                        "3. Use **Bold** for headers and key medical terms.\n"
-                        "4. Keep paragraphs short (2-3 sentences max) for mobile readability.\n"
-                        "5. Never combine multiple steps into a single paragraph."
+                        "Use Markdown formatting.\n"
+                        "Use clear bullet points and short paragraphs.\n"
+                        "Avoid long walls of text."
                     )
                 },
                 {"role": "user", "content": req.text},
             ],
-            # Increased tokens to allow for properly formatted, longer lists
             max_tokens=500,
         )
-        return {"answer": resp.choices[0].message.content}
+
+        english_answer = resp.choices[0].message.content
+
+        # 2️⃣ Translate if needed
+        final_answer = translate_text(english_answer, req.language)
+
+        return {"answer": final_answer}
 
     except BadRequestError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
