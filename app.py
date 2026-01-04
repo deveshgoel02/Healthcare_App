@@ -1,4 +1,4 @@
-# app.py — HealthBot Backend (API-only, Render-safe, Multilingual)
+# app.py — HealthBot Backend (IP-based + Live Outbreak Alerts)
 
 import os
 import threading
@@ -8,16 +8,15 @@ from datetime import datetime
 from typing import List
 from contextlib import asynccontextmanager
 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Groq client
 from groq import Groq, BadRequestError
 
-# SQLAlchemy
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -28,13 +27,14 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 load_dotenv()
 
 GROQ_KEY = os.getenv("GROQ_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
 client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
 
 # --------------------------------------------------
-# DATABASE SETUP
+# DATABASE (unchanged)
 # --------------------------------------------------
 DB_URL = os.getenv("HEALTH_DB_URL", "sqlite:///health.db")
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
@@ -49,15 +49,6 @@ class Reminder(Base):
     message = Column(Text)
     remind_at = Column(DateTime)
     sent = Column(Boolean, default=False)
-
-
-class Alert(Base):
-    __tablename__ = "alerts"
-    id = Column(Integer, primary_key=True)
-    title = Column(String)
-    message = Column(Text)
-    region = Column(String)
-    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -82,28 +73,26 @@ def reminder_worker(check_interval: int = 15):
             ).all()
 
             for r in rows:
-                print(f"[Reminder] {r.message}")
                 r.sent = True
                 db.add(r)
 
             db.commit()
             db.close()
-        except Exception as e:
-            print("Reminder worker error:", e)
+        except Exception:
+            pass
 
         time.sleep(check_interval)
 
 
 def start_worker():
     global _worker_thread
-    if _worker_thread and _worker_thread.is_alive():
-        return
-    _worker_thread = threading.Thread(target=reminder_worker, daemon=True)
-    _worker_thread.start()
+    if not _worker_thread or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(target=reminder_worker, daemon=True)
+        _worker_thread.start()
 
 
 # --------------------------------------------------
-# FASTAPI LIFESPAN
+# FASTAPI APP
 # --------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,18 +100,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-# --------------------------------------------------
-# FASTAPI APP
-# --------------------------------------------------
 app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 
-
-# --------------------------------------------------
-# CORS
-# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -135,37 +117,57 @@ async def preflight_handler(path: str, request: Request):
 
 
 # --------------------------------------------------
-# REQUEST MODELS
+# REQUEST MODEL
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
-    language: str = "english"   # e.g. english, hindi, marathi, tamil
-
-
-class SymptomCheckRequest(BaseModel):
-    symptoms: List[str]
-    age: int | None = None
-    comorbidities: List[str] | None = None
+    language: str = "english"
 
 
 # --------------------------------------------------
-# HEALTH LOGIC (simple)
+# IP → LOCATION
 # --------------------------------------------------
-DISEASE_SYMPTOMS = {
-    "dengue": {"fever", "headache", "joint pain", "rash"},
-    "malaria": {"fever", "chills", "sweating"},
-    "covid-19": {"fever", "cough", "fatigue"},
-}
+def get_location_from_ip(ip: str):
+    try:
+        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
+        data = r.json()
+        return data.get("city"), data.get("region"), data.get("country_name")
+    except Exception:
+        return None, None, None
 
 
-def match_diseases(symptoms: List[str]):
-    s = {x.lower() for x in symptoms}
-    results = []
-    for d, core in DISEASE_SYMPTOMS.items():
-        overlap = len(s & core)
-        if overlap:
-            results.append((d, round(overlap / len(core) * 100, 1)))
-    return sorted(results, key=lambda x: -x[1])
+# --------------------------------------------------
+# LIVE OUTBREAK CHECK (News API)
+# --------------------------------------------------
+def check_live_outbreaks(city: str):
+    if not city or not NEWS_API_KEY:
+        return None
+
+    query = f"dengue OR malaria OR covid outbreak {city}"
+    url = (
+        "https://newsapi.org/v2/everything?"
+        f"q={query}&"
+        "language=en&"
+        "sortBy=publishedAt&"
+        f"apiKey={NEWS_API_KEY}"
+    )
+
+    try:
+        resp = requests.get(url, timeout=5).json()
+        articles = resp.get("articles", [])[:3]
+
+        if not articles:
+            return None
+
+        headlines = "\n".join(f"• {a['title']}" for a in articles)
+
+        return (
+            f"🚨 **Health Alert in {city}**\n\n"
+            f"{headlines}\n\n"
+            "⚠️ Please follow official health advisories.\n\n---\n"
+        )
+    except Exception:
+        return None
 
 
 # --------------------------------------------------
@@ -177,19 +179,21 @@ def root():
         "status": "ok",
         "model": GROQ_MODEL,
         "groq_key_present": bool(GROQ_KEY),
+        "news_api_present": bool(NEWS_API_KEY),
     }
 
 
 @app.post("/predict")
-def predict(req: ChatRequest):
+def predict(req: ChatRequest, request: Request):
     if not client:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "GROQ_API_KEY missing"}
-        )
+        return JSONResponse(500, {"error": "GROQ_API_KEY missing"})
 
     try:
-        language = (req.language or "english").lower()
+        language = req.language.lower()
+        client_ip = request.client.host
+
+        city, region, country = get_location_from_ip(client_ip)
+        outbreak_alert = check_live_outbreaks(city)
 
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -197,14 +201,10 @@ def predict(req: ChatRequest):
                 {
                     "role": "system",
                     "content": (
-                        f"You are a helpful and empathetic public health assistant.\n"
-                        f"Respond ONLY in {language}.\n\n"
-                        "Formatting rules:\n"
-                        "- Use Markdown\n"
-                        "- Each bullet or step must be on a new line\n"
-                        "- Use **bold headings**\n"
-                        "- Keep paragraphs short and mobile-friendly\n"
-                        "- Avoid long walls of text"
+                        f"You are a medical public health assistant.\n"
+                        f"Respond ONLY in {language}.\n"
+                        "Use Markdown.\n"
+                        "Use short paragraphs and bullet points."
                     )
                 },
                 {"role": "user", "content": req.text},
@@ -212,16 +212,15 @@ def predict(req: ChatRequest):
             max_tokens=500,
         )
 
-        return {"answer": resp.choices[0].message.content}
+        answer = resp.choices[0].message.content
+
+        if outbreak_alert:
+            answer = outbreak_alert + answer
+
+        return {"answer": answer}
 
     except BadRequestError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
+        return JSONResponse(400, {"error": str(e)})
     except Exception:
         print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"error": "internal_error"})
-
-
-@app.post("/symptom_check")
-def symptom_check(req: SymptomCheckRequest):
-    return {"probable": match_diseases(req.symptoms)}
+        return JSONResponse(500, {"error": "internal_error"})
