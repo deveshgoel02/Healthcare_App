@@ -307,3 +307,26 @@ def predict(req: ChatRequest, request: Request):
     except Exception:
         print(traceback.format_exc())
         return JSONResponse(500, {"error": "internal_error"})
+
+@app.get("/outbreaks")
+def outbreaks(request: Request, city: Optional[str] = None):
+    if city:
+        alert = check_live_outbreaks(city.title())
+        return {
+            "city": city.title(),
+            "alert": alert
+        }
+
+    client_ip = get_real_ip(request)
+    location = get_location_from_ip(client_ip)
+
+    if not location:
+        return {"city": None, "alert": None}
+
+    city, _, _ = location
+    alert = check_live_outbreaks(city)
+
+    return {
+        "city": city,
+        "alert": alert
+    }
