@@ -64,7 +64,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # --------------------------------------------------
-# BACKGROUND WORKER (unchanged)
+# BACKGROUND WORKER
 # --------------------------------------------------
 STOP_FLAG = False
 _worker_thread = None
@@ -122,7 +122,7 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 # --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # safe for testing
+    allow_origins=["*"],  # tighten later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -139,7 +139,7 @@ async def preflight_handler(path: str, request: Request):
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
-    language: str = "English"
+    language: str = "english"   # e.g. english, hindi, marathi, tamil
 
 
 class SymptomCheckRequest(BaseModel):
@@ -149,30 +149,7 @@ class SymptomCheckRequest(BaseModel):
 
 
 # --------------------------------------------------
-# TRANSLATION HELPER (NEW)
-# --------------------------------------------------
-def translate_text(text: str, target_language: str):
-    if not target_language or target_language.lower() == "english":
-        return text
-
-    prompt = (
-        f"Translate the following medical response into {target_language}. "
-        f"Keep it accurate, clear, and simple.\n\n{text}"
-    )
-
-    try:
-        resp = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception:
-        return text  # fallback
-
-
-# --------------------------------------------------
-# HEALTH LOGIC (simple matching)
+# HEALTH LOGIC (simple)
 # --------------------------------------------------
 DISEASE_SYMPTOMS = {
     "dengue": {"fever", "headache", "joint pain", "rash"},
@@ -212,17 +189,22 @@ def predict(req: ChatRequest):
         )
 
     try:
-        # 1️⃣ Generate answer in English
+        language = (req.language or "english").lower()
+
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        "You are a helpful and empathetic public health assistant.\n"
-                        "Use Markdown formatting.\n"
-                        "Use clear bullet points and short paragraphs.\n"
-                        "Avoid long walls of text."
+                        f"You are a helpful and empathetic public health assistant.\n"
+                        f"Respond ONLY in {language}.\n\n"
+                        "Formatting rules:\n"
+                        "- Use Markdown\n"
+                        "- Each bullet or step must be on a new line\n"
+                        "- Use **bold headings**\n"
+                        "- Keep paragraphs short and mobile-friendly\n"
+                        "- Avoid long walls of text"
                     )
                 },
                 {"role": "user", "content": req.text},
@@ -230,12 +212,7 @@ def predict(req: ChatRequest):
             max_tokens=500,
         )
 
-        english_answer = resp.choices[0].message.content
-
-        # 2️⃣ Translate if needed
-        final_answer = translate_text(english_answer, req.language)
-
-        return {"answer": final_answer}
+        return {"answer": resp.choices[0].message.content}
 
     except BadRequestError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
