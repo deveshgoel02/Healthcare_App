@@ -1,6 +1,6 @@
 # app.py — HealthBot Backend (FINAL – Production Ready)
 # Features:
-# ✅ Multilingual responses
+# ✅ Multilingual (script-correct)
 # ✅ Frontend city override + IP fallback
 # ✅ Live outbreak alerts via NewsAPI
 # ✅ Render/Vercel safe
@@ -128,12 +128,41 @@ async def preflight_handler(path: str, request: Request):
 
 
 # --------------------------------------------------
-# REQUEST MODEL (🔥 UPDATED)
+# REQUEST MODEL
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
     language: str = "english"
-    city: Optional[str] = None   # ✅ FRONTEND OVERRIDE
+    city: Optional[str] = None
+
+
+# --------------------------------------------------
+# LANGUAGE → STRICT SCRIPT ENFORCEMENT 🔥
+# --------------------------------------------------
+def get_language_instruction(language: str) -> str:
+    instructions = {
+        "english": "Respond in English.",
+        "hindi": (
+            "Respond ONLY in Hindi using **Devanagari script**.\n"
+            "DO NOT use English letters.\n"
+            "DO NOT use Hinglish.\n"
+            "Example (correct): आपको सिरदर्द है\n"
+            "Example (wrong): aapko headache hai"
+        ),
+        "marathi": (
+            "Respond ONLY in Marathi using **Devanagari script**.\n"
+            "Do NOT use English letters."
+        ),
+        "tamil": (
+            "Respond ONLY in Tamil using **Tamil script**.\n"
+            "Do NOT use English letters."
+        ),
+        "telugu": (
+            "Respond ONLY in Telugu using **Telugu script**.\n"
+            "Do NOT use English letters."
+        ),
+    }
+    return instructions.get(language, "Respond in English.")
 
 
 # --------------------------------------------------
@@ -221,7 +250,7 @@ def root():
 
 
 # --------------------------------------------------
-# MAIN CHAT ENDPOINT (🔥 FIXED)
+# MAIN CHAT ENDPOINT (FINAL)
 # --------------------------------------------------
 @app.post("/predict")
 def predict(req: ChatRequest, request: Request):
@@ -230,12 +259,12 @@ def predict(req: ChatRequest, request: Request):
 
     try:
         language = req.language.lower()
+        language_instruction = get_language_instruction(language)
 
-        # 1️⃣ City priority: frontend → IP → none
+        # City priority: frontend → IP → none
         city = None
-
         if req.city:
-            city = req.city.strip().lower().title()
+            city = req.city.strip().title()
         else:
             client_ip = get_real_ip(request)
             location = get_location_from_ip(client_ip)
@@ -244,18 +273,20 @@ def predict(req: ChatRequest, request: Request):
 
         outbreak_alert = check_live_outbreaks(city) if city else None
 
-        # 2️⃣ LLM RESPONSE
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {
                     "role": "system",
                     "content": (
-                        f"You are a public health assistant.\n"
-                        f"Respond ONLY in {language}.\n"
-                        "Use Markdown.\n"
-                        "Use bullet points.\n"
-                        "Keep paragraphs short."
+                        "You are a public health assistant.\n\n"
+                        f"{language_instruction}\n\n"
+                        "Formatting rules:\n"
+                        "- Use Markdown\n"
+                        "- Each bullet point on a new line\n"
+                        "- Use **bold headings**\n"
+                        "- Keep paragraphs short\n"
+                        "- If the script is incorrect, rewrite correctly"
                     )
                 },
                 {"role": "user", "content": req.text},
