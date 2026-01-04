@@ -1,4 +1,4 @@
-# app.py — HealthBot Backend (IP-based + Live Outbreak Alerts)
+# app.py — HealthBot Backend (FINAL: IP-based + Live Outbreak Alerts)
 
 import os
 import threading
@@ -104,7 +104,7 @@ app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -125,15 +125,30 @@ class ChatRequest(BaseModel):
 
 
 # --------------------------------------------------
-# IP → LOCATION
+# HELPER: Detect outbreak intent
+# --------------------------------------------------
+def is_outbreak_query(text: str) -> bool:
+    keywords = [
+        "outbreak", "cases", "spread", "near me",
+        "nearby", "epidemic", "dengue", "malaria", "covid"
+    ]
+    text = text.lower()
+    return any(k in text for k in keywords)
+
+
+# --------------------------------------------------
+# HELPER: IP → LOCATION
 # --------------------------------------------------
 def get_location_from_ip(ip: str):
     try:
-        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
-        data = r.json()
-        return data.get("city"), data.get("region"), data.get("country_name")
+        resp = requests.get(
+            f"https://ipapi.co/{ip}/json/",
+            timeout=5
+        )
+        data = resp.json()
+        return data.get("city"), data.get("country_name")
     except Exception:
-        return None, None, None
+        return None, None
 
 
 # --------------------------------------------------
@@ -143,28 +158,41 @@ def check_live_outbreaks(city: str):
     if not city or not NEWS_API_KEY:
         return None
 
-    query = f"dengue OR malaria OR covid outbreak {city}"
-    url = (
-        "https://newsapi.org/v2/everything?"
-        f"q={query}&"
-        "language=en&"
-        "sortBy=publishedAt&"
-        f"apiKey={NEWS_API_KEY}"
+    query = (
+        f"{city} dengue OR malaria OR covid outbreak "
+        "health advisory"
     )
 
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": 3,
+        "apiKey": NEWS_API_KEY,
+    }
+
     try:
-        resp = requests.get(url, timeout=5).json()
-        articles = resp.get("articles", [])[:3]
+        resp = requests.get(
+            "https://newsapi.org/v2/everything",
+            params=params,
+            timeout=5
+        )
+        data = resp.json()
+        articles = data.get("articles", [])
 
         if not articles:
             return None
 
-        headlines = "\n".join(f"• {a['title']}" for a in articles)
+        headlines = "\n".join(
+            f"- **{a['title']}**"
+            for a in articles
+            if a.get("title")
+        )
 
         return (
-            f"🚨 **Health Alert in {city}**\n\n"
+            f"🚨 **Live Health Alerts near {city}**\n\n"
             f"{headlines}\n\n"
-            "⚠️ Please follow official health advisories.\n\n---\n"
+            "_Source: NewsAPI_\n\n---\n"
         )
     except Exception:
         return None
@@ -186,14 +214,20 @@ def root():
 @app.post("/predict")
 def predict(req: ChatRequest, request: Request):
     if not client:
-        return JSONResponse(500, {"error": "GROQ_API_KEY missing"})
+        return JSONResponse(
+            status_code=500,
+            content={"error": "GROQ_API_KEY missing"}
+        )
 
     try:
         language = req.language.lower()
         client_ip = request.client.host
 
-        city, region, country = get_location_from_ip(client_ip)
-        outbreak_alert = check_live_outbreaks(city)
+        city, country = get_location_from_ip(client_ip)
+
+        outbreak_alert = None
+        if is_outbreak_query(req.text):
+            outbreak_alert = check_live_outbreaks(city)
 
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
@@ -201,10 +235,13 @@ def predict(req: ChatRequest, request: Request):
                 {
                     "role": "system",
                     "content": (
-                        f"You are a medical public health assistant.\n"
-                        f"Respond ONLY in {language}.\n"
-                        "Use Markdown.\n"
-                        "Use short paragraphs and bullet points."
+                        f"You are a public health assistant.\n"
+                        f"Respond ONLY in {language}.\n\n"
+                        "Formatting rules:\n"
+                        "- Use Markdown\n"
+                        "- Bullet points on new lines\n"
+                        "- Short paragraphs\n"
+                        "- Clear medical guidance\n"
                     )
                 },
                 {"role": "user", "content": req.text},
@@ -220,7 +257,11 @@ def predict(req: ChatRequest, request: Request):
         return {"answer": answer}
 
     except BadRequestError as e:
-        return JSONResponse(400, {"error": str(e)})
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
     except Exception:
         print(traceback.format_exc())
-        return JSONResponse(500, {"error": "internal_error"})
+        return JSONResponse(
+            status_code=500,
+            content={"error": "internal_error"}
+        )
