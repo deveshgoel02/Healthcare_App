@@ -1,12 +1,18 @@
-# app.py — HealthBot Backend (FINAL: IP-based + Live Outbreak Alerts)
+# app.py — HealthBot Backend (Production Ready)
+# Features:
+# ✅ Multilingual responses
+# ✅ Real client IP detection (Render/Vercel safe)
+# ✅ Live outbreak alerts via NewsAPI
+# ✅ Markdown formatted output
+# ✅ CORS enabled
 
 import os
 import threading
 import time
 import traceback
 from datetime import datetime
-from typing import List
 from contextlib import asynccontextmanager
+from typing import List, Optional
 
 import requests
 from fastapi import FastAPI, Request
@@ -16,7 +22,6 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from groq import Groq, BadRequestError
-
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -61,12 +66,11 @@ STOP_FLAG = False
 _worker_thread = None
 
 
-def reminder_worker(check_interval: int = 15):
+def reminder_worker(interval: int = 15):
     while not STOP_FLAG:
         try:
             db = SessionLocal()
             now = datetime.utcnow()
-
             rows = db.query(Reminder).filter(
                 Reminder.sent == False,
                 Reminder.remind_at <= now
@@ -81,13 +85,15 @@ def reminder_worker(check_interval: int = 15):
         except Exception:
             pass
 
-        time.sleep(check_interval)
+        time.sleep(interval)
 
 
 def start_worker():
     global _worker_thread
     if not _worker_thread or not _worker_thread.is_alive():
-        _worker_thread = threading.Thread(target=reminder_worker, daemon=True)
+        _worker_thread = threading.Thread(
+            target=reminder_worker, daemon=True
+        )
         _worker_thread.start()
 
 
@@ -100,7 +106,11 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
+app = FastAPI(
+    title="HealthBot Backend",
+    description="Multilingual AI Health Assistant with Live Outbreak Alerts",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -117,7 +127,7 @@ async def preflight_handler(path: str, request: Request):
 
 
 # --------------------------------------------------
-# REQUEST MODEL
+# REQUEST MODELS
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
@@ -125,60 +135,60 @@ class ChatRequest(BaseModel):
 
 
 # --------------------------------------------------
-# HELPER: Detect outbreak intent
+# REAL CLIENT IP (FIXED)
 # --------------------------------------------------
-def is_outbreak_query(text: str) -> bool:
-    keywords = [
-        "outbreak", "cases", "spread", "near me",
-        "nearby", "epidemic", "dengue", "malaria", "covid"
-    ]
-    text = text.lower()
-    return any(k in text for k in keywords)
+def get_real_ip(request: Request) -> Optional[str]:
+    """
+    Correct way to get real client IP behind Render / Vercel / proxies
+    """
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip
+
+    return request.client.host
 
 
 # --------------------------------------------------
-# HELPER: IP → LOCATION
+# IP → LOCATION
 # --------------------------------------------------
 def get_location_from_ip(ip: str):
+    if not ip:
+        return None
+
     try:
-        resp = requests.get(
+        r = requests.get(
             f"https://ipapi.co/{ip}/json/",
             timeout=5
         )
-        data = resp.json()
-        return data.get("city"), data.get("country_name")
+        data = r.json()
+        return data.get("city"), data.get("region"), data.get("country_name")
     except Exception:
-        return None, None
+        return None
 
 
 # --------------------------------------------------
-# LIVE OUTBREAK CHECK (News API)
+# LIVE OUTBREAK CHECK (NewsAPI)
 # --------------------------------------------------
 def check_live_outbreaks(city: str):
     if not city or not NEWS_API_KEY:
         return None
 
-    query = (
-        f"{city} dengue OR malaria OR covid outbreak "
-        "health advisory"
+    query = f"dengue OR malaria OR covid outbreak {city}"
+    url = (
+        "https://newsapi.org/v2/everything?"
+        f"q={query}&"
+        "language=en&"
+        "sortBy=publishedAt&"
+        f"apiKey={NEWS_API_KEY}"
     )
 
-    params = {
-        "q": query,
-        "language": "en",
-        "sortBy": "publishedAt",
-        "pageSize": 3,
-        "apiKey": NEWS_API_KEY,
-    }
-
     try:
-        resp = requests.get(
-            "https://newsapi.org/v2/everything",
-            params=params,
-            timeout=5
-        )
-        data = resp.json()
-        articles = data.get("articles", [])
+        resp = requests.get(url, timeout=6).json()
+        articles = resp.get("articles", [])[:3]
 
         if not articles:
             return None
@@ -190,16 +200,16 @@ def check_live_outbreaks(city: str):
         )
 
         return (
-            f"🚨 **Live Health Alerts near {city}**\n\n"
+            f"🚨 **Local Health Alert — {city}**\n\n"
             f"{headlines}\n\n"
-            "_Source: NewsAPI_\n\n---\n"
+            "⚠️ Follow official health advisories.\n\n---\n"
         )
     except Exception:
         return None
 
 
 # --------------------------------------------------
-# API ROUTES
+# ROOT
 # --------------------------------------------------
 @app.get("/")
 def root():
@@ -211,6 +221,9 @@ def root():
     }
 
 
+# --------------------------------------------------
+# MAIN CHAT ENDPOINT
+# --------------------------------------------------
 @app.post("/predict")
 def predict(req: ChatRequest, request: Request):
     if not client:
@@ -221,14 +234,17 @@ def predict(req: ChatRequest, request: Request):
 
     try:
         language = req.language.lower()
-        client_ip = request.client.host
 
-        city, country = get_location_from_ip(client_ip)
+        # 🔑 FIXED IP DETECTION
+        client_ip = get_real_ip(request)
+        location = get_location_from_ip(client_ip)
 
         outbreak_alert = None
-        if is_outbreak_query(req.text):
+        if location:
+            city, region, country = location
             outbreak_alert = check_live_outbreaks(city)
 
+        # 🧠 LLM RESPONSE
         resp = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
@@ -236,12 +252,11 @@ def predict(req: ChatRequest, request: Request):
                     "role": "system",
                     "content": (
                         f"You are a public health assistant.\n"
-                        f"Respond ONLY in {language}.\n\n"
-                        "Formatting rules:\n"
-                        "- Use Markdown\n"
-                        "- Bullet points on new lines\n"
-                        "- Short paragraphs\n"
-                        "- Clear medical guidance\n"
+                        f"Respond ONLY in {language}.\n"
+                        "Use Markdown.\n"
+                        "Use short paragraphs.\n"
+                        "Use bullet points for lists.\n"
+                        "Avoid long walls of text."
                     )
                 },
                 {"role": "user", "content": req.text},
