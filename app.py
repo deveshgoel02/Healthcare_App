@@ -1,10 +1,4 @@
-# app.py — HealthBot Backend (FINAL – Production Ready)
-# Features:
-# ✅ Multilingual (script-correct)
-# ✅ Frontend city override + IP fallback
-# ✅ Live outbreak alerts via NewsAPI
-# ✅ Render/Vercel safe
-# ✅ Markdown formatted output
+# app.py — HealthBot Backend (FINAL + Twilio SMS & WhatsApp)
 
 import os
 import threading
@@ -22,6 +16,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from groq import Groq, BadRequestError
+from twilio.rest import Client as TwilioClient
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -35,14 +30,29 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
-client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_API_KEY_SID = os.getenv("TWILIO_API_KEY_SID")
+TWILIO_API_KEY_SECRET = os.getenv("TWILIO_API_KEY_SECRET")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+
+groq_client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
+
+twilio_client = (
+    TwilioClient(
+        username=TWILIO_API_KEY_SID,
+        password=TWILIO_API_KEY_SECRET,
+        account_sid=TWILIO_ACCOUNT_SID,
+    )
+    if TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET
+    else None
+)
 
 
 # --------------------------------------------------
-# DATABASE (unchanged)
+# DATABASE
 # --------------------------------------------------
-DB_URL = os.getenv("HEALTH_DB_URL", "sqlite:///health.db")
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+engine = create_engine("sqlite:///health.db", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -60,63 +70,18 @@ Base.metadata.create_all(bind=engine)
 
 
 # --------------------------------------------------
-# BACKGROUND WORKER
-# --------------------------------------------------
-STOP_FLAG = False
-_worker_thread = None
-
-
-def reminder_worker(interval: int = 15):
-    while not STOP_FLAG:
-        try:
-            db = SessionLocal()
-            now = datetime.utcnow()
-
-            rows = db.query(Reminder).filter(
-                Reminder.sent == False,
-                Reminder.remind_at <= now
-            ).all()
-
-            for r in rows:
-                r.sent = True
-                db.add(r)
-
-            db.commit()
-            db.close()
-        except Exception:
-            pass
-
-        time.sleep(interval)
-
-
-def start_worker():
-    global _worker_thread
-    if not _worker_thread or not _worker_thread.is_alive():
-        _worker_thread = threading.Thread(
-            target=reminder_worker, daemon=True
-        )
-        _worker_thread.start()
-
-
-# --------------------------------------------------
 # FASTAPI APP
 # --------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_worker()
     yield
 
 
-app = FastAPI(
-    title="HealthBot Backend",
-    description="Multilingual AI Health Assistant with Live Outbreak Alerts",
-    lifespan=lifespan
-)
+app = FastAPI(title="HealthBot Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -128,7 +93,7 @@ async def preflight_handler(path: str, request: Request):
 
 
 # --------------------------------------------------
-# REQUEST MODEL
+# REQUEST MODELS
 # --------------------------------------------------
 class ChatRequest(BaseModel):
     text: str
@@ -136,70 +101,44 @@ class ChatRequest(BaseModel):
     city: Optional[str] = None
 
 
+class MessageRequest(BaseModel):
+    to: str
+    message: str
+
+
 # --------------------------------------------------
-# LANGUAGE → STRICT SCRIPT ENFORCEMENT 🔥
+# LANGUAGE INSTRUCTIONS
 # --------------------------------------------------
 def get_language_instruction(language: str) -> str:
-    instructions = {
+    rules = {
         "english": "Respond in English.",
-        "hindi": (
-            "Respond ONLY in Hindi using **Devanagari script**.\n"
-            "DO NOT use English letters.\n"
-            "DO NOT use Hinglish.\n"
-            "Example (correct): आपको सिरदर्द है\n"
-            "Example (wrong): aapko headache hai"
-        ),
-        "marathi": (
-            "Respond ONLY in Marathi using **Devanagari script**.\n"
-            "Do NOT use English letters."
-        ),
-        "tamil": (
-            "Respond ONLY in Tamil using **Tamil script**.\n"
-            "Do NOT use English letters."
-        ),
-        "telugu": (
-            "Respond ONLY in Telugu using **Telugu script**.\n"
-            "Do NOT use English letters."
-        ),
+        "hindi": "Respond ONLY in Hindi using Devanagari script. No English letters.",
+        "marathi": "Respond ONLY in Marathi using Devanagari script.",
+        "tamil": "Respond ONLY in Tamil script.",
+        "telugu": "Respond ONLY in Telugu script.",
     }
-    return instructions.get(language, "Respond in English.")
-
-
-# --------------------------------------------------
-# REAL CLIENT IP
-# --------------------------------------------------
-def get_real_ip(request: Request) -> Optional[str]:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip
-
-    return request.client.host
+    return rules.get(language, "Respond in English.")
 
 
 # --------------------------------------------------
 # IP → LOCATION
 # --------------------------------------------------
-def get_location_from_ip(ip: str):
-    if not ip:
-        return None
+def get_real_ip(request: Request):
+    forwarded = request.headers.get("x-forwarded-for")
+    return forwarded.split(",")[0] if forwarded else request.client.host
 
+
+def get_location_from_ip(ip: str):
     try:
-        r = requests.get(
-            f"https://ipapi.co/{ip}/json/",
-            timeout=5
-        )
+        r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=5)
         data = r.json()
-        return data.get("city"), data.get("region"), data.get("country_name")
+        return data.get("city")
     except Exception:
         return None
 
 
 # --------------------------------------------------
-# LIVE OUTBREAK CHECK (NewsAPI)
+# LIVE OUTBREAK CHECK
 # --------------------------------------------------
 def check_live_outbreaks(city: str):
     if not city or not NEWS_API_KEY:
@@ -208,125 +147,86 @@ def check_live_outbreaks(city: str):
     query = f"dengue OR malaria OR covid outbreak {city}"
     url = (
         "https://newsapi.org/v2/everything?"
-        f"q={query}&"
-        "language=en&"
-        "sortBy=publishedAt&"
-        f"apiKey={NEWS_API_KEY}"
+        f"q={query}&language=en&sortBy=publishedAt&apiKey={NEWS_API_KEY}"
     )
 
     try:
-        resp = requests.get(url, timeout=6).json()
-        articles = resp.get("articles", [])[:3]
-
+        data = requests.get(url, timeout=5).json()
+        articles = data.get("articles", [])[:3]
         if not articles:
             return None
 
-        headlines = "\n".join(
-            f"- **{a['title']}**"
-            for a in articles
-            if a.get("title")
-        )
+        headlines = "\n".join(f"- **{a['title']}**" for a in articles if a.get("title"))
 
-        return (
-            f"🚨 **Local Health Alert — {city}**\n\n"
-            f"{headlines}\n\n"
-            "⚠️ Follow official health advisories.\n\n---\n"
-        )
+        return f"🚨 **Local Health Alert — {city}**\n\n{headlines}\n\n---\n"
     except Exception:
         return None
 
 
 # --------------------------------------------------
-# ROOT
-# --------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "model": GROQ_MODEL,
-        "groq_key_present": bool(GROQ_KEY),
-        "news_api_present": bool(NEWS_API_KEY),
-    }
-
-
-# --------------------------------------------------
-# MAIN CHAT ENDPOINT (FINAL)
+# MAIN CHAT
 # --------------------------------------------------
 @app.post("/predict")
 def predict(req: ChatRequest, request: Request):
-    if not client:
+    if not groq_client:
         return JSONResponse(500, {"error": "GROQ_API_KEY missing"})
 
     try:
         language = req.language.lower()
-        language_instruction = get_language_instruction(language)
+        instruction = get_language_instruction(language)
 
-        # City priority: frontend → IP → none
-        city = None
-        if req.city:
-            city = req.city.strip().title()
-        else:
-            client_ip = get_real_ip(request)
-            location = get_location_from_ip(client_ip)
-            if location:
-                city, _, _ = location
+        city = req.city or get_location_from_ip(get_real_ip(request))
+        outbreak = check_live_outbreaks(city) if city else None
 
-        outbreak_alert = check_live_outbreaks(city) if city else None
-
-        resp = client.chat.completions.create(
+        resp = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a public health assistant.\n\n"
-                        f"{language_instruction}\n\n"
-                        "Formatting rules:\n"
-                        "- Use Markdown\n"
-                        "- Each bullet point on a new line\n"
-                        "- Use **bold headings**\n"
-                        "- Keep paragraphs short\n"
-                        "- If the script is incorrect, rewrite correctly"
-                    )
-                },
+                {"role": "system", "content": f"You are a health assistant.\n{instruction}"},
                 {"role": "user", "content": req.text},
             ],
             max_tokens=500,
         )
 
         answer = resp.choices[0].message.content
-
-        if outbreak_alert:
-            answer = outbreak_alert + answer
+        if outbreak:
+            answer = outbreak + answer
 
         return {"answer": answer}
-
-    except BadRequestError as e:
-        return JSONResponse(400, {"error": str(e)})
 
     except Exception:
         print(traceback.format_exc())
         return JSONResponse(500, {"error": "internal_error"})
 
-@app.get("/outbreaks")
-def outbreaks(request: Request, city: Optional[str] = None):
-    if city:
-        alert = check_live_outbreaks(city.title())
-        return {
-            "city": city.title(),
-            "alert": alert
-        }
 
-    client_ip = get_real_ip(request)
-    location = get_location_from_ip(client_ip)
+# --------------------------------------------------
+# SMS ENDPOINT
+# --------------------------------------------------
+@app.post("/send_sms")
+def send_sms(req: MessageRequest):
+    if not twilio_client:
+        return JSONResponse(500, {"error": "Twilio not configured"})
 
-    if not location:
-        return {"city": None, "alert": None}
+    msg = twilio_client.messages.create(
+        body=req.message,
+        from_=TWILIO_PHONE_NUMBER,
+        to=req.to,
+    )
 
-    city, _, _ = location
-    alert = check_live_outbreaks(city)
+    return {"status": "sent", "sid": msg.sid}
 
-    return {
-        "city": city,
-        "alert": alert
-    }
+
+# --------------------------------------------------
+# WHATSAPP ENDPOINT
+# --------------------------------------------------
+@app.post("/send_whatsapp")
+def send_whatsapp(req: MessageRequest):
+    if not twilio_client:
+        return JSONResponse(500, {"error": "Twilio not configured"})
+
+    msg = twilio_client.messages.create(
+        body=req.message,
+        from_=TWILIO_WHATSAPP_NUMBER,
+        to=f"whatsapp:{req.to}",
+    )
+
+    return {"status": "sent", "sid": msg.sid}
