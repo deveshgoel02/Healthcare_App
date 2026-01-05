@@ -230,3 +230,14 @@ def send_whatsapp(req: MessageRequest):
     )
 
     return {"status": "sent", "sid": msg.sid}
+
+@app.get("/")
+def home():
+    return {
+        "status": "ok",
+        "message": "HealthBot backend is running 🚀",
+        "endpoints": {
+            "chat": "POST /predict",
+            "outbreaks": "GET /outbreaks"
+        }
+    }
