@@ -6,4 +6,6 @@ python-multipart
 sqlalchemy
 groq
 requests
+python-jose
+passlib[bcrypt]
 
